@@ -130,6 +130,15 @@ from liger_kernel.ops.backends._cutedsl._cute_lib.rmsnorm_fwd import rmsnorm_fwd
 _BWD_MAX_TILE_CUTEDSL = 32768
 
 
+def _bwd_thread_config(N: int) -> Tuple[int, int]:
+    """Return (CTA threads, threads per row) for the host and kernel layout."""
+    num_threads = 128 if N <= 4096 else 256
+    for limit, threads in [(64, 8), (128, 16), (256, 32), (512, 64), (4096, 128)]:
+        if N <= limit:
+            return num_threads, threads
+    return num_threads, 256
+
+
 # ===========================================================================
 # Backward kernel — inline CuTe DSL
 #
@@ -167,14 +176,10 @@ class _LigerRMSNormCuTeDSLBackward(ReductionBase):
             )
 
     def _num_threads(self):
-        return 128 if self.N <= 4096 else 256
+        return _bwd_thread_config(self.N)[0]
 
     def _threads_per_row(self):
-        N = self.N
-        for limit, threads in [(64, 8), (128, 16), (256, 32), (512, 64), (4096, 128)]:
-            if N <= limit:
-                return threads
-        return 256
+        return _bwd_thread_config(self.N)[1]
 
     def _set_cluster_n(self):
         N = self.N
@@ -695,9 +700,11 @@ def _rms_norm_cutedsl_backward(
         # Allocate in x_flat's dtype so the kernel signature matches.
         dx = torch.empty(dy_flat.shape, dtype=x_flat.dtype, device=dy_flat.device)
 
-    sm_count = _bwd_sm_count(N, x_flat.device)
-    # Saturate the grid: never launch more SMs than rows.
-    sm_count = min(sm_count, max(M, 1))
+    # Cap the persistent grid by row tiles; use the same count for partials.
+    num_threads, threads_per_row = _bwd_thread_config(N)
+    rows_per_tile = num_threads // threads_per_row
+    num_row_tiles = (M + rows_per_tile - 1) // rows_per_tile
+    sm_count = min(_bwd_sm_count(N, x_flat.device), max(num_row_tiles, 1))
 
     has_weight = w_eff is not None
     dw_partial = torch.empty((sm_count, N), dtype=torch.float32, device=x_flat.device) if has_weight else None

@@ -534,9 +534,15 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
     elif X.device.type == "npu":
         sm_count = get_npu_core_count()
 
+    use_row_kernel = BLOCK_SIZE > 256 or n_rows < 4096 * 8 or row_mode
+    rows_per_program = max(1, math.ceil(n_rows / sm_count))
+    # Only the row kernel uses contiguous groups; the block kernel strides
+    # over 16-row tiles and retains its existing persistent grid.
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program)) if use_row_kernel else sm_count
+
     if W is not None:
         # fp32 for numerical stability especially.
-        _dW = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
+        _dW = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
         elementwise_affine = True
     else:
         _dW = None
@@ -544,8 +550,7 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
 
     if n_cols > BLOCK_SIZE:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    rows_per_program = math.ceil(n_rows / sm_count)
-    grid = (sm_count,)
+    grid = (num_ctas,)
 
     if in_place is True:
         dX = dY
@@ -558,7 +563,7 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
         set_large_grf_mode(kernel_args)
 
     with device_context(X.device):
-        if BLOCK_SIZE > 256 or n_rows < 4096 * 8 or row_mode:
+        if use_row_kernel:
             _rms_norm_backward_kernel[grid](
                 dY,
                 dY.stride(0),
