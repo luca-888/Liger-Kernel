@@ -300,13 +300,16 @@ def fused_add_rms_norm_backward(
     elif S.device.type == "npu":
         sm_count = get_npu_core_count()
 
+    # Keep contiguous row groups and omit CTAs with no rows to process.
+    rows_per_program = max(1, math.ceil(n_rows / sm_count))
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program))
+
     # fp32 for numerical stability especially.
-    _dW = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
+    _dW = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
 
     if n_cols > BLOCK_SIZE:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    rows_per_program = math.ceil(n_rows / sm_count)
-    grid = (sm_count,)
+    grid = (num_ctas,)
 
     if in_place is True:
         dX = dY

@@ -292,17 +292,20 @@ def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
     elif X.device.type == "npu":
         sm_count = get_npu_core_count()
 
+    # Keep contiguous row groups and omit CTAs with no rows to process.
+    rows_per_program = max(1, math.ceil(n_rows / sm_count))
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program))
+
     # Allocate or reuse gradients
     if in_place is True:
         dX = dY
     else:
         dX = torch.zeros_like(dY)
 
-    _dW = torch.empty((sm_count, 3), dtype=torch.float32, device=W.device)
-    _dB = torch.empty((sm_count,), dtype=torch.float32, device=W.device)
+    _dW = torch.empty((num_ctas, 3), dtype=torch.float32, device=W.device)
+    _dB = torch.empty((num_ctas,), dtype=torch.float32, device=W.device)
 
-    rows_per_program = math.ceil(n_rows / sm_count)
-    grid = (sm_count,)
+    grid = (num_ctas,)
 
     # XPU-specific optimization
     kernel_args = {}
@@ -331,7 +334,7 @@ def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
         **kernel_args,
     )
 
-    # Reduce gradients across SMs
+    # Reduce gradients across CTAs.
     dX = dX.view(*shape)
     dW = _dW.sum(dim=0).to(W.dtype)
     dB = _dB.sum().to(W.dtype)
