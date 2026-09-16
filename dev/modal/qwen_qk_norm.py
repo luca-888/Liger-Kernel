@@ -21,6 +21,10 @@ if modal.is_local():
 
     REMOTE = Path(REMOTE_ROOT_PATH)
     PINS = ["torch==2.9.1", "torchvision==0.24.1", "triton==3.5.1", "transformers==5.15.1"]
+    CAUSAL_CONV_WHEEL = (
+        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/"
+        "causal_conv1d-1.7.0%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+    )
     image = (
         base_image.apt_install("build-essential", "git")
         .uv_pip_install(
@@ -34,6 +38,14 @@ if modal.is_local():
             "matplotlib==3.10.7",
             "seaborn==0.13.2",
             "ruff==0.15.22",
+            "flash-linear-attention==0.5.2",
+            "tilelang==0.1.14",
+            "nvidia-cuda-nvcc==13.0.88",
+            "nvidia-cuda-cccl==13.0.85",
+            "nvidia-nvvm==13.0.88",
+            "nvidia-cuda-crt==13.0.88",
+            "nvidia-cuda-runtime==13.0.96",
+            CAUSAL_CONV_WHEEL,
         )
         .env(
             {
@@ -43,6 +55,7 @@ if modal.is_local():
                 "HF_DATASETS_OFFLINE": "1",
                 "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
                 "LIGER_KERNEL_IMPL": "",
+                "FLA_TILELANG": "1",
             }
         )
         .workdir(str(REMOTE))
@@ -78,10 +91,23 @@ def run_job(command: list[str], baseline_source: str = ""):
     report = {
         "command": command,
         "python": platform.python_version(),
-        "packages": {p: importlib.metadata.version(p) for p in ("torch", "triton", "transformers")},
+        "packages": {
+            p: importlib.metadata.version(p)
+            for p in (
+                "torch",
+                "triton",
+                "transformers",
+                "flash-linear-attention",
+                "fla-core",
+                "causal-conv1d",
+                "tilelang",
+                "nvidia-cuda-nvcc",
+            )
+        },
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
         "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else None,
+        "gpu_count": torch.cuda.device_count(),
         "driver": subprocess.check_output(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True
         ).strip()
@@ -126,9 +152,11 @@ def main(command: str, output: str, baseline_ref: str = "", gpu: str = "H100!"):
         baseline = subprocess.check_output(
             ["git", "show", f"{baseline_ref}:src/liger_kernel/transformers/monkey_patch.py"], text=True
         )
-    if gpu not in {"H100!", "none"}:
-        raise ValueError("gpu must be H100! or none (CPU binding checks only)")
+    if gpu not in {"H100!", "H100!:8", "none"}:
+        raise ValueError("gpu must be H100!, H100!:8, or none (CPU binding checks only)")
     worker = run_job if gpu == "none" else run_job.with_options(gpu=gpu)
+    if gpu == "H100!:8":
+        worker = worker.with_options(cpu=32, memory=196608)
     try:
         result = worker.remote(shlex.split(command), baseline)
     except Exception as error:

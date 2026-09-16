@@ -1,175 +1,196 @@
 {
-  "base_commit": "95b01e94027cc70ffec7233e89d3e9fa31fb72f7",
-  "draft_reason": "Three BF16 MoE convergence test rows fail on both the original main implementation and the patch. Values/failed assertions vary; cause unresolved.",
-  "environment": {
-    "python": "3.12.10",
-    "packages": {
-      "torch": "2.9.1",
-      "triton": "3.5.1",
-      "transformers": "5.15.1"
-    },
-    "cuda": "12.8",
-    "gpu": "NVIDIA H100 80GB HBM3",
-    "gpu_memory_bytes": 85017624576,
-    "driver": "580.95.05"
+  "checkstyle": {
+    "status": "passed",
+    "log": "qwen-qk-norm-results/checkstyle.log"
   },
-  "implementation_sha256": {
-    "src/liger_kernel/transformers/monkey_patch.py": "ba3c725b71f112aa7ef98a5c8207e573aa19c4098a446571b96d6f228cafa7d5",
-    "test/transformers/test_monkey_patch.py": "2903ff82009ec24d5dbab0376f0c202ae69d1ac633e1906e2f478cbfe7ff3879"
-  },
-  "instance_tests": {
-    "passed": 21,
-    "failed": 0,
-    "skipped": 0
-  },
-  "rmsnorm_tests": {
-    "passed": 64,
-    "failed": 0,
-    "skipped": 0,
-    "deselected_dtensor": 8
-  },
-  "baseline_instance_regression": {
-    "expected_failures": 13,
-    "hardware": "Modal CPU",
-    "failure": "New Q/K forward binding assertion"
-  },
-  "convergence": {
-    "suites": {
-      "convergence-h100-final": {
-        "passed": 10,
-        "failed": 3,
-        "skipped": 5,
-        "xml": "convergence-h100-final/convergence.xml"
+  "not_run": [
+    "8 distributed DTensor RMSNorm cases were deselected on single GPU.",
+    "No existing text-only Qwen3.5 MoE with-logits convergence case exists.",
+    "Complete repository correctness and convergence suites were not run."
+  ],
+  "scope": "Fresh rerun only; no prior result artifacts reused.",
+  "model_convergence": {
+    "mini_qwen3": {
+      "bf16.test_mini_models": {
+        "status": "passed"
       },
-      "multimodal-h100-final": {
-        "passed": 4,
-        "failed": 0,
-        "skipped": 0,
-        "xml": "multimodal-h100-final/multimodal.xml"
+      "bf16.test_mini_models_with_logits": {
+        "status": "passed"
       },
-      "convergence-h100-baseline": {
-        "failed": 3,
-        "passed": 0,
-        "skipped": 0,
-        "baseline_ref": "95b01e9",
-        "xml": "convergence-h100-baseline/baseline-convergence.xml"
+      "fp32.test_mini_models": {
+        "status": "passed"
+      },
+      "fp32.test_mini_models_with_logits": {
+        "status": "passed"
       }
     },
-    "models": {
-      "qwen3": {
-        "bf16.test_mini_models": "passed",
-        "bf16.test_mini_models_with_logits": "passed",
-        "fp32.test_mini_models": "passed",
-        "fp32.test_mini_models_with_logits": "passed"
+    "mini_qwen3_moe": {
+      "bf16.test_mini_models": {
+        "status": "passed"
       },
-      "qwen3_moe": {
-        "bf16.test_mini_models": "failed",
-        "bf16.test_mini_models_with_logits": "failed",
-        "fp32.test_mini_models": "passed",
-        "fp32.test_mini_models_with_logits": "passed"
+      "bf16.test_mini_models_with_logits": {
+        "status": "failed",
+        "message": "AssertionError: [Top k logprobs]Number of mismatched elements: 1928\nMismatch at index (0, 0, 0): tensor1[(0, 0, 0)] = -3.4954581260681152, tensor2[(0, 0, 0)] = -3.0724966526031494\nMismatch at index (0, 1, 0): tensor1[(0, 1, 0)] = -3.4954581260681152, tensor2[(0, 1, 0)] = -3.0724966526031494\nMismatch at index (0, 2, 0): tensor1[(0, 2, 0)] = -3.4954581260681152, tensor2[(0, 2, 0)] = -3.0724966526031494\nMismatch at index (0, 3, 0): tensor1[(0, 3, 0)] = -3.4954581260681152, tensor2[(0, 3, 0)] = -3.0724966526031494\nMismatch at index (0, 4, 0): tensor1[(0, 4, 0)] = -3.4954581260681152, tensor2[(0, 4, 0)] = -3.0724966526031494\n... and 1923 more mismatched elements."
       },
-      "qwen3_next": {
-        "bf16.test_mini_models": "passed",
-        "bf16.test_mini_models_with_logits": "passed",
-        "fp32.test_mini_models": "skipped",
-        "fp32.test_mini_models_with_logits": "skipped"
+      "fp32.test_mini_models": {
+        "status": "passed"
       },
-      "qwen3_5_moe": {
-        "bf16.test_mini_models": "failed",
-        "fp32.test_mini_models": "skipped",
-        "bf16.test_mini_models_multimodal": "passed",
-        "fp32.test_mini_models_multimodal": "passed"
-      },
-      "qwen3_5": {
-        "bf16.test_mini_models": "passed",
-        "bf16.test_mini_models_with_logits": "passed",
-        "fp32.test_mini_models": "skipped",
-        "fp32.test_mini_models_with_logits": "skipped",
-        "bf16.test_mini_models_multimodal": "passed",
-        "fp32.test_mini_models_multimodal": "passed"
+      "fp32.test_mini_models_with_logits": {
+        "status": "passed"
       }
     },
-    "baseline_failures": [
-      {
-        "test": "test.convergence.bf16.test_mini_models::test_mini_model[mini_qwen3_moe-32-1e-05-dtype7-0.05-0.2-0.1-0.1-0.01-0.01]",
-        "baseline_status": "failed",
-        "candidate_status": "failed",
-        "identical_failure": false,
-        "message": "AssertionError: [Top k logprobs]Number of mismatched elements: 1894\nMismatch at index (0, 0, 0): tensor1[(0, 0, 0)] = -3.343414306640625, tensor2[(0, 0, 0)] = -2.9230871200561523\nMismatch at index (0, 1, 0): tensor1[(0, 1, 0)] = -3.343414306640625, tensor2[(0, 1, 0)] = -2.9230871200561523\nMismatch at index (0, 2, 0): tensor1[(0, 2, 0)] = -3.343414306640625, tensor2[(0, 2, 0)] = -2.9230871200561523\nMismatch at index (0, 3, 0): tensor1[(0, 3, 0)] = -3.343414306640625, tensor2[(0, 3, 0)] = -2.9230871200561523\nMismatch at index (0, 4, 0): tensor1[(0, 4, 0)] = -3.343414306640625, tensor2[(0, 4, 0)] = -2.9230871200561523\n... and 1889 more mismatched elements."
+    "mini_qwen3_next": {
+      "bf16.test_mini_models": {
+        "status": "passed"
       },
-      {
-        "test": "test.convergence.bf16.test_mini_models::test_mini_model[mini_qwen3_5_moe-32-1e-05-dtype30-0.05-0.2-0.1-0.1-0.01-0.01]",
-        "baseline_status": "failed",
-        "candidate_status": "failed",
-        "identical_failure": false,
-        "message": "AssertionError: [Top k logprobs]Number of mismatched elements: 1894\nMismatch at index (0, 0, 0): tensor1[(0, 0, 0)] = -2.804410934448242, tensor2[(0, 0, 0)] = -2.146850824356079\nMismatch at index (0, 1, 0): tensor1[(0, 1, 0)] = -2.804410934448242, tensor2[(0, 1, 0)] = -2.146850824356079\nMismatch at index (0, 2, 0): tensor1[(0, 2, 0)] = -2.804410934448242, tensor2[(0, 2, 0)] = -2.146850824356079\nMismatch at index (0, 3, 0): tensor1[(0, 3, 0)] = -2.804410934448242, tensor2[(0, 3, 0)] = -2.146850824356079\nMismatch at index (0, 4, 0): tensor1[(0, 4, 0)] = -2.804410934448242, tensor2[(0, 4, 0)] = -2.146850824356079\n... and 1889 more mismatched elements."
+      "bf16.test_mini_models_with_logits": {
+        "status": "passed"
       },
-      {
-        "test": "test.convergence.bf16.test_mini_models_with_logits::test_mini_model[mini_qwen3_moe-32-1e-05-dtype7-0.01-0.2-0.1-0.01-0.01-0.01]",
-        "baseline_status": "failed",
-        "candidate_status": "failed",
-        "identical_failure": false,
-        "message": "AssertionError: [Top k logprobs]Number of mismatched elements: 1928\nMismatch at index (0, 0, 0): tensor1[(0, 0, 0)] = -3.4954581260681152, tensor2[(0, 0, 0)] = -3.2225534915924072\nMismatch at index (0, 1, 0): tensor1[(0, 1, 0)] = -3.4954581260681152, tensor2[(0, 1, 0)] = -3.2225534915924072\nMismatch at index (0, 2, 0): tensor1[(0, 2, 0)] = -3.4954581260681152, tensor2[(0, 2, 0)] = -3.2225534915924072\nMismatch at index (0, 3, 0): tensor1[(0, 3, 0)] = -3.4954581260681152, tensor2[(0, 3, 0)] = -3.2225534915924072\nMismatch at index (0, 4, 0): tensor1[(0, 4, 0)] = -3.4954581260681152, tensor2[(0, 4, 0)] = -3.2225534915924072\n... and 1923 more mismatched elements."
+      "fp32.test_mini_models": {
+        "status": "skipped",
+        "message": "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32.\n Torch's implementation takes too long"
+      },
+      "fp32.test_mini_models_with_logits": {
+        "status": "skipped",
+        "message": "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32.\n Torch's implementation takes too long"
       }
-    ]
-  },
-  "benchmark_meta_validation": {
-    "passed": 10,
-    "scope": "Construction, bindings and query layouts; not GPU numerical execution"
-  },
-  "benchmark_runs": {
-    "benchmark-qwen3-h100": {
-      "statuses": {
-        "ok": 36
-      },
-      "cases": 36,
-      "rounds_per_successful_case": 5
     },
-    "benchmark-qwen3_5-h100": {
-      "statuses": {
-        "ok": 34,
-        "oom": 2
+    "mini_qwen3_5_moe": {
+      "bf16.test_mini_models": {
+        "status": "passed"
       },
-      "cases": 36,
-      "rounds_per_successful_case": 5
+      "fp32.test_mini_models": {
+        "status": "skipped",
+        "message": "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32.\n Torch's implementation takes too long"
+      },
+      "bf16.test_mini_models_multimodal": {
+        "status": "passed"
+      },
+      "fp32.test_mini_models_multimodal": {
+        "status": "passed"
+      }
     },
-    "benchmark-supplement-h100": {
-      "statuses": {
-        "ok": 16,
-        "capacity_excluded": 3
+    "mini_qwen3_5": {
+      "bf16.test_mini_models": {
+        "status": "passed"
       },
-      "cases": 19,
-      "rounds_per_successful_case": 5
+      "bf16.test_mini_models_with_logits": {
+        "status": "passed"
+      },
+      "fp32.test_mini_models": {
+        "status": "skipped",
+        "message": "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32.\n Torch's implementation takes too long"
+      },
+      "fp32.test_mini_models_with_logits": {
+        "status": "skipped",
+        "message": "flash-linear-attention's ChunkGatedDeltaRuleFunction does not support float32.\n Torch's implementation takes too long"
+      },
+      "bf16.test_mini_models_multimodal": {
+        "status": "passed"
+      },
+      "fp32.test_mini_models_multimodal": {
+        "status": "passed"
+      }
     }
   },
-  "checkstyle": "passed",
-  "not_run": [
-    "Full repository test suite",
-    "Unrelated convergence models and VL convergence",
-    "Multi-GPU DTensor tests",
-    "No existing Qwen3.5 MoE with-logits convergence case",
-    "Full MoE training and routing; capacity exclusions documented",
-    "Separate Qwen3.5 MoE complete-attention timing; same Q/K geometry represented by Next"
+  "baseline_replay": [
+    {
+      "nodeid": "test/convergence/bf16/test_mini_models_with_logits.py::test_mini_model[mini_qwen3_moe-32-1e-05-dtype7-0.01-0.2-0.1-0.01-0.01-0.01]",
+      "candidate_status": "failed",
+      "baseline_status": "failed",
+      "same_message": false
+    }
   ],
-  "artifacts": "validation-logs.tar.gz",
-  "capacity_exclusions": {
-    "qwen3_next": {
-      "status": "capacity_excluded",
-      "parameter_count": 79674391296,
-      "parameter_and_gradient_lower_bound_bytes": 318697565184,
-      "scope": "Full MoE training cannot fit on one H100; no reduced model or routing measurement substituted."
+  "scope_analysis": {
+    "production_change": "13 added lines only inside existing if model is not None instance-patching branches.",
+    "convergence_path": "Existing convergence harnesses call liger_kernel_patch_func(**kwargs) without model before create_model; the changed instance branch does not execute.",
+    "limit": "This static scope evidence does not turn a failure into a pass or establish an unidentified numerical root cause; baseline outcomes are reported individually."
+  },
+  "final_totals": {
+    "passed": 101,
+    "failed": 1,
+    "skipped": 5
+  },
+  "hybrid_backend_probe": {
+    "status": "passed",
+    "shape": [
+      1,
+      128,
+      4,
+      64
+    ],
+    "loss": 0.00010493409354239702,
+    "required_dispatch": "common:chunk_bwd_dqkwg:tilelang",
+    "executed_dispatches": [
+      "common:chunk_bwd_dqkwg:tilelang"
+    ],
+    "FLA_TILELANG": "1",
+    "scope": "Actual HF Qwen3.5 chunk Gated Delta Rule forward/backward with FLA and TileLang; no full model training."
+  },
+  "hf_source_audit": "qwen-qk-norm-results/green-and-rms/hf-source-audit.json",
+  "red_green_proof": {
+    "baseline_ref": "95b01e9",
+    "new_assertions_failed_before_fix": 13,
+    "same_cases_pass_after_fix": 13,
+    "preserved_vl_and_rope_tests": 8
+  },
+  "suites": {
+    "red_instances": {
+      "counts": {
+        "passed": 8,
+        "failed": 13
+      },
+      "junit": "qwen-qk-norm-results/red-instances/instances.xml",
+      "environment": "qwen-qk-norm-results/red-instances/environment.json"
     },
-    "qwen3_moe": {
-      "status": "capacity_excluded",
-      "parameter_count": 30532122624,
-      "parameter_and_gradient_lower_bound_bytes": 122128490496,
-      "scope": "Full MoE training cannot fit on one H100; no reduced model or routing measurement substituted."
+    "green_instances": {
+      "counts": {
+        "passed": 21
+      },
+      "junit": "qwen-qk-norm-results/green-and-rms/instances.xml",
+      "environment": "qwen-qk-norm-results/green-and-rms/environment.json"
     },
-    "qwen3_5_moe": {
-      "status": "capacity_excluded",
-      "parameter_count": 34660610688,
-      "parameter_and_gradient_lower_bound_bytes": 138642442752,
-      "scope": "Full MoE training cannot fit on one H100; no reduced model or routing measurement substituted."
+    "rms_numerical": {
+      "counts": {
+        "passed": 64
+      },
+      "junit": "qwen-qk-norm-results/green-and-rms/rms.xml",
+      "environment": "qwen-qk-norm-results/green-and-rms/environment.json"
+    },
+    "text_convergence": {
+      "counts": {
+        "passed": 12,
+        "failed": 1,
+        "skipped": 5
+      },
+      "junit": "qwen-qk-norm-results/text-convergence-tilelang/text.xml",
+      "environment": "qwen-qk-norm-results/text-convergence-tilelang/environment.json"
+    },
+    "multimodal_convergence": {
+      "counts": {
+        "passed": 4
+      },
+      "junit": "qwen-qk-norm-results/multimodal-convergence-tilelang/multimodal.xml",
+      "environment": "qwen-qk-norm-results/multimodal-convergence-tilelang/environment.json"
+    },
+    "baseline_qwen3_moe": {
+      "counts": {
+        "passed": 1,
+        "failed": 1
+      },
+      "junit": "qwen-qk-norm-results/baseline-qwen3-moe-tilelang/baseline.xml",
+      "environment": "qwen-qk-norm-results/baseline-qwen3-moe-tilelang/environment.json"
+    }
+  },
+  "superseded_environment_attempts": {
+    "text_convergence_before_tilelang": {
+      "counts": {
+        "passed": 6,
+        "failed": 7,
+        "skipped": 5
+      },
+      "junit": "qwen-qk-norm-results/text-convergence/text.xml",
+      "environment": "qwen-qk-norm-results/text-convergence/environment.json"
     }
   }
 }
