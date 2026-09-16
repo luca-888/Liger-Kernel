@@ -152,11 +152,9 @@ def main(command: str, output: str, baseline_ref: str = "", gpu: str = "H100!"):
         baseline = subprocess.check_output(
             ["git", "show", f"{baseline_ref}:src/liger_kernel/transformers/monkey_patch.py"], text=True
         )
-    if gpu not in {"H100!", "H100!:8", "none"}:
-        raise ValueError("gpu must be H100!, H100!:8, or none (CPU binding checks only)")
+    if gpu not in {"H100!", "none"}:
+        raise ValueError("gpu must be H100! or none (CPU binding checks only)")
     worker = run_job if gpu == "none" else run_job.with_options(gpu=gpu)
-    if gpu == "H100!:8":
-        worker = worker.with_options(cpu=32, memory=196608)
     try:
         result = worker.remote(shlex.split(command), baseline)
     except Exception as error:

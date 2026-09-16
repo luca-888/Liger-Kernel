@@ -15,7 +15,6 @@ import signal
 import statistics
 import subprocess
 import sys
-import time
 import traceback
 
 from importlib.metadata import version
@@ -26,20 +25,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"), required=True)
     parser.add_argument("--group", choices=("B", "C"))
-    parser.add_argument("--level", choices=("norm", "attention", "model"))
-    parser.add_argument("--levels", nargs="+", choices=("norm", "attention", "model"), help="Limit matrix levels.")
+    parser.add_argument("--level", choices=("norm", "attention"))
+    parser.add_argument("--levels", nargs="+", choices=("norm", "attention"), help="Limit matrix levels.")
     parser.add_argument("--batch-size", type=int, choices=(1, 4))
     parser.add_argument("--seq-len", type=int, choices=(128, 2048, 8192))
     parser.add_argument("--overwrite", action="store_true", help="Accepted for make run-benchmarks compatibility.")
-    parser.add_argument("--primary", action="store_true", help="Only per-rank B4/S2048 and B1/S8192.")
-    parser.add_argument(
-        "--probe-only", action="store_true", help="One untimed forward/backward/optimizer validation step."
-    )
+    parser.add_argument("--primary", action="store_true", help="Only B4/S2048 and B1/S8192.")
     parser.add_argument("--matrix", action="store_true", help="Run every group/level/shape in separate subprocesses.")
     parser.add_argument(
         "--validate-only", action="store_true", help="Validate construction, bindings and layouts on meta device."
     )
-    parser.add_argument("--timeout", type=int, default=1800, help="Per-process/group timeout in seconds.")
+    parser.add_argument("--timeout", type=int, default=1800, help="Per-process timeout in seconds.")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--output", type=Path, required=True)
     if len(sys.argv) == 1 or sys.argv[1:] == ["--overwrite"]:
@@ -48,8 +44,6 @@ def parse_args():
     args = parser.parse_args()
     if args.rounds < 5:
         parser.error("At least five independent measurement rounds are required.")
-    if args.probe_only and ((args.matrix and args.levels != ["model"]) or (not args.matrix and args.level != "model")):
-        parser.error("--probe-only applies to full-model steps; use --level model or --matrix --levels model.")
     if not args.matrix and any(getattr(args, key) is None for key in ("group", "level", "batch_size", "seq_len")):
         parser.error("Single cases require --group, --level, --batch-size and --seq-len.")
     return args
@@ -176,23 +170,20 @@ def parameter_initializers(model, gemma):
     return rules
 
 
-def initialize_parameters(model, rules, std, rank=0, world_size=1, prefix=""):
-    """Initialize only local storage, with HF distributions and deterministic seeds.
+def initialize_parameters(model, rules, std, prefix=""):
+    """Initialize attention with HF distributions and deterministic per-name seeds.
 
     This preserves HF's initialization semantics, not its serial RNG sequence.
-    FSDP shards use independent per-name/per-rank generators; B/C hashes verify
-    the actual resulting bytes rather than assuming equal seeds imply equality.
+    B/C hashes verify the actual resulting bytes.
     """
     import torch
-
-    from torch.distributed.tensor import DTensor
 
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             full_name = f"{prefix}.{name}" if prefix else name
-            local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            local = parameter
             kind, padding_idx = rules[full_name]
-            seed = int.from_bytes(hashlib.sha256(f"42:{full_name}:{rank}".encode()).digest()[:8], "little")
+            seed = int.from_bytes(hashlib.sha256(f"42:{full_name}:0".encode()).digest()[:8], "little")
             generator = torch.Generator(device=local.device).manual_seed(seed)
             if kind == "normal":
                 local.normal_(mean=0.0, std=std, generator=generator)
@@ -203,204 +194,24 @@ def initialize_parameters(model, rules, std, rank=0, world_size=1, prefix=""):
             else:
                 local.zero_()
             if padding_idx is not None:
-                shard_rows = (parameter.shape[0] + world_size - 1) // world_size
-                index = padding_idx - rank * shard_rows
-                if 0 <= index < local.shape[0]:
-                    local[index].zero_()
+                if 0 <= padding_idx < local.shape[0]:
+                    local[padding_idx].zero_()
 
 
-def tensor_hash(named_tensors, rank=0):
+def tensor_hash(named_tensors):
     import torch
-
-    from torch.distributed.tensor import DTensor
 
     digest = hashlib.sha256()
     for name, tensor in named_tensors:
-        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-        metadata = (name, tuple(tensor.shape), str(tensor.dtype), str(getattr(tensor, "placements", None)), rank)
+        local = tensor
+        metadata = (name, tuple(tensor.shape), str(tensor.dtype), "None", 0)
         digest.update(repr(metadata).encode())
         digest.update(local.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
     return digest.hexdigest()
 
 
-def distributed_training(args, report, model, rules, config):
-    import torch
-    import torch.distributed as dist
-
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import MixedPrecisionPolicy
-    from torch.distributed.fsdp import fully_shard
-    from torch.distributed.tensor import DTensor
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    assert world_size == 8, "Full-model training requires exactly eight H100 workers."
-    mesh = init_device_mesh("cuda", (world_size,))
-    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    for layer in model.model.layers:
-        fully_shard(layer, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
-    # Keep embedding and LM head in the root group: FLCE accesses head.weight
-    # directly and would bypass a separately sharded head's forward hook.
-    fully_shard(model, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
-    model.to_empty(device=torch.device("cuda", rank))
-    initialize_parameters(model, rules, config.initializer_range, rank, world_size)
-    # to_empty also empties nonpersistent buffers. Recreate both RoPE buffers.
-    rotary = model.model.rotary_emb
-    model.model.rotary_emb = type(rotary)(config, device=torch.device("cuda", rank))
-    assert all(not buffer.is_meta for buffer in model.buffers())
-    shard_hashes = [None] * world_size
-    dist.all_gather_object(shard_hashes, tensor_hash(model.named_parameters(), rank))
-    report["rank_initial_weights_sha256"] = shard_hashes
-    report["initial_weights_sha256"] = hashlib.sha256("".join(shard_hashes).encode()).hexdigest()
-    report["buffer_sha256"] = tensor_hash(model.named_buffers())
-    buffer_hashes = [None] * world_size
-    dist.all_gather_object(buffer_hashes, report["buffer_sha256"])
-    assert len(set(buffer_hashes)) == 1, "RoPE buffers must match on every rank."
-    report["weight_hash_scope"] = "All actual FP32 local shards, combined in rank order."
-    report["initialization"] = (
-        "HF distributions/special values; deterministic parameter-name/rank RNG, not HF serial RNG."
-    )
-    generator = torch.Generator(device=f"cuda:{rank}").manual_seed(1234 + rank)
-    ids = torch.randint(config.vocab_size, (args.batch_size, args.seq_len), device=f"cuda:{rank}", generator=generator)
-    input_hashes = [None] * world_size
-    dist.all_gather_object(input_hashes, tensor_hash([("input_ids", ids)], rank))
-    report["rank_input_sha256"] = input_hashes
-    report["input_checksum"] = hashlib.sha256("".join(input_hashes).encode()).hexdigest()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, foreach=False, fused=False)
-
-    def step():
-        optimizer.zero_grad(set_to_none=True)
-        loss = model(input_ids=ids, labels=ids, use_cache=False).loss
-        loss.backward()
-        optimizer.step()
-        return loss.detach()
-
-    def check_loss(loss):
-        valid = torch.isfinite(loss).to(torch.int32)
-        dist.all_reduce(valid, op=dist.ReduceOp.MIN)
-        assert valid.item(), "A rank produced a non-finite loss."
-
-    delta = next(
-        (module for module in model.modules() if hasattr(module, "A_log") and hasattr(module, "dt_bias")), None
-    )
-    observed_delta_dtypes = {}
-    hook = None
-    if delta is not None:
-
-        def observe_delta(module, _):
-            observed_delta_dtypes.update(A_log=str(module.A_log.dtype), dt_bias=str(module.dt_bias.dtype))
-
-        hook = delta.register_forward_pre_hook(observe_delta)
-    for _ in range(1 if args.probe_only else 3):
-        loss = step()
-        check_loss(loss)
-    if hook is not None:
-        hook.remove()
-    report["observed_delta_compute_parameter_dtypes"] = observed_delta_dtypes
-    if args.model in {"qwen3_5", "qwen3_5_moe"}:
-        from fla.ops.backends import BackendRegistry
-
-        required_dispatch = "common:chunk_bwd_dqkwg:tilelang"
-        executed_dispatches = sorted(BackendRegistry._registries["common"]._logged)
-        assert required_dispatch in executed_dispatches, "The supported TileLang GDN backward must actually execute."
-        report["hybrid_backend_dispatch"] = {
-            "required": required_dispatch,
-            "executed": executed_dispatches,
-            "FLA_TILELANG": os.environ.get("FLA_TILELANG"),
-            "tilelang_version": version("tilelang"),
-        }
-    torch.cuda.synchronize()
-    for parameter in model.parameters():
-        assert isinstance(parameter, DTensor) and parameter.dtype == torch.float32
-        assert parameter.grad is not None and parameter.grad.dtype == torch.float32
-        for key in ("exp_avg", "exp_avg_sq"):
-            state = optimizer.state.get(parameter, {}).get(key)
-            assert state is not None and state.dtype == torch.float32
-    report["verified_precision"] = {
-        "master": "float32",
-        "gradient": "float32",
-        "exp_avg": "float32",
-        "exp_avg_sq": "float32",
-    }
-    local_state_bytes = sum(
-        state.to_local().numel() * state.element_size()
-        for states in optimizer.state.values()
-        for key, state in states.items()
-        if key in {"exp_avg", "exp_avg_sq"}
-    )
-    state_bytes = [None] * world_size
-    dist.all_gather_object(state_bytes, local_state_bytes)
-    report["optimizer_state_bytes_per_rank"] = state_bytes
-    report["scope"] = "Complete text causal LM on eight GPUs; original depth/experts/vocabulary, no vision encoder."
-    if args.probe_only:
-        report["status"] = "probed"
-        report["probe_loss_per_rank"] = [None] * world_size
-        dist.all_gather_object(report["probe_loss_per_rank"], float(loss))
-        return
-    torch.cuda.reset_peak_memory_stats()
-    wall_rounds, cuda_rounds = [], []
-    for _ in range(args.rounds):
-        walls, events = [], []
-        for _ in range(3):
-            dist.barrier()
-            torch.cuda.synchronize()
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            started = time.perf_counter()
-            start.record()
-            loss = step()
-            end.record()
-            torch.cuda.synchronize()
-            elapsed = (time.perf_counter() - started) * 1000
-            # Reduction is outside the timed interval; include the slowest rank.
-            times = torch.tensor([elapsed, start.elapsed_time(end)], device=f"cuda:{rank}")
-            dist.all_reduce(times, op=dist.ReduceOp.MAX)
-            walls.append(times[0].item())
-            events.append(times[1].item())
-            check_loss(loss)
-        wall_rounds.append(statistics.median(walls))
-        cuda_rounds.append(statistics.median(events))
-    peaks = [None] * world_size
-    dist.all_gather_object(peaks, torch.cuda.max_memory_allocated())
-    result = {
-        **summarize(wall_rounds),
-        "cuda_event_round_ms": cuda_rounds,
-        "timing": "Synchronized wall time, maximum rank; includes zero_grad, forward, backward, optimizer and FSDP communication.",
-        "warmup_iterations": 3,
-        "repetitions_per_round": 3,
-        "peak_allocated_bytes": max(peaks),
-        "peak_allocated_bytes_per_rank": peaks,
-    }
-    result["tokens_per_second"] = world_size * args.batch_size * args.seq_len * 1000 / result["median_ms"]
-    report["measurements"] = {"training_step": result}
-
-
 def run(args, report):
     import torch
-
-    distributed = args.level == "model" and not args.validate_only
-    if distributed:
-        from datetime import timedelta
-
-        import torch.distributed as dist
-
-        rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(rank)
-        dist.init_process_group("nccl", timeout=timedelta(seconds=180))
-        assert dist.get_world_size() == 8
-        hardware = {
-            "rank": rank,
-            "name": torch.cuda.get_device_name(rank),
-            "total_memory_bytes": torch.cuda.get_device_properties(rank).total_memory,
-        }
-        report["rank_hardware"] = [None] * 8
-        dist.all_gather_object(report["rank_hardware"], hardware)
-        assert all(
-            gpu["name"] == "NVIDIA H100 80GB HBM3" and 78 * 2**30 <= gpu["total_memory_bytes"] <= 81 * 2**30
-            for gpu in report["rank_hardware"]
-        ), f"Hardware mismatch: training requires 8 H100 80GB HBM3 GPUs; got {report['rank_hardware']}"
-        assert len({(gpu["name"], gpu["total_memory_bytes"]) for gpu in report["rank_hardware"]}) == 1
-    # Select the rank's device before imports that may inspect CUDA (e.g. FLA).
     import transformers
 
     from liger_kernel.transformers import monkey_patch
@@ -446,16 +257,8 @@ def run(args, report):
         settings={
             "dtype": "bfloat16",
             "attention_backend": "sdpa",
-            "gradient_checkpointing": distributed,
-            "checkpoint_use_reentrant": False if distributed else None,
-            "world_size": 8 if distributed else 1,
-            "parameter_master_dtype": "float32" if distributed else "bfloat16",
-            "gradient_reduce_dtype": "float32" if distributed else None,
-            "optimizer_state_dtype": "float32" if distributed else None,
-            "A_log_dt_bias": "FP32 master, BF16 unsharded parameter, explicit HF float32 math"
-            if gemma and distributed
-            else None,
-            "fsdp": "FSDP2 decoder+root, reshard_after_forward=True" if distributed else None,
+            "gradient_checkpointing": False,
+            "parameter_master_dtype": "bfloat16",
             "torch_compile": False,
             "tf32": False,
             "use_cache": False,
@@ -465,7 +268,6 @@ def run(args, report):
             "rope": False,
             "cross_entropy": False,
             "fused_linear_cross_entropy": True,
-            "optimizer": "AdamW(lr=1e-5, foreach=False, fused=False)" if distributed else None,
         },
     )
     # Always create the native, full-config HF instance on meta before patching.
@@ -535,9 +337,6 @@ def run(args, report):
         report["validation_scope"] = (
             "Meta-device configuration, model construction, forward bindings and query layout only; no CUDA execution."
         )
-        return
-    if distributed:
-        distributed_training(args, report, model, rules, config)
         return
     base = model.model
     layer_index, layer = next((i, layer) for i, layer in enumerate(base.layers) if hasattr(layer, "self_attn"))
@@ -610,7 +409,7 @@ def write_comparison(directory, model):
     rows = []
     for path in sorted(directory.glob(f"{model}_*_B.json")):
         baseline = json.loads(path.read_text())
-        if baseline.get("model") != model:
+        if baseline.get("model") != model or baseline.get("level") not in {"norm", "attention"}:
             continue
         candidate = json.loads(path.with_name(path.name.replace("_B.json", "_C.json")).read_text())
         if baseline["status"] != "ok" or candidate["status"] != "ok":
@@ -626,14 +425,9 @@ def write_comparison(directory, model):
         ):
             assert baseline[key] == candidate[key], f"B/C mismatch for {key}: {path.name}"
         assert baseline.get("linear_attention_kernels") == candidate.get("linear_attention_kernels")
-        assert baseline.get("hybrid_backend_dispatch") == candidate.get("hybrid_backend_dispatch")
-        assert baseline.get("rank_hardware") == candidate.get("rank_hardware")
         for component, measurements in baseline["measurements"].items():
-            modes = {"full": measurements} if component == "training_step" else measurements
-            for mode, before in modes.items():
-                after = candidate["measurements"][component]
-                if component != "training_step":
-                    after = after[mode]
+            for mode, before in measurements.items():
+                after = candidate["measurements"][component][mode]
                 rows.append(
                     {
                         "model": model,
@@ -651,8 +445,6 @@ def write_comparison(directory, model):
                         "C_max_ms": after["max_ms"],
                         "B_peak_allocated_bytes": before["peak_allocated_bytes"],
                         "C_peak_allocated_bytes": after["peak_allocated_bytes"],
-                        "B_tokens_per_second": before.get("tokens_per_second", ""),
-                        "C_tokens_per_second": after.get("tokens_per_second", ""),
                     }
                 )
     if rows:
@@ -663,7 +455,7 @@ def write_comparison(directory, model):
 
 
 def run_process(command, output, timeout):
-    """Keep a failed worker/group visible and terminate all ranks on timeout."""
+    """Keep failed cases visible and stop the subprocess on timeout."""
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite a prior benchmark case: {output}")
     with subprocess.Popen(
@@ -681,33 +473,16 @@ def run_process(command, output, timeout):
                 os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate()
             data = {"status": "timeout", "timeout_seconds": timeout, "stdout": stdout, "stderr": stderr}
-    failures = [json.loads(path.read_text()) for path in sorted(output.parent.glob(f"{output.stem}.rank*.json"))]
-    if failures:
-        data["rank_failures"] = failures
-        data["status"] = "oom" if any(failure["status"] == "oom" for failure in failures) else "error"
-    if data.get("returncode", 0) != 0 and data["status"] in {"ok", "probed", "validated"}:
+    if data.get("returncode", 0) != 0 and data["status"] in {"ok", "validated"}:
         data["status"] = "process_error"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(data, indent=2, default=str) + "\n")
     return data
 
 
-def distributed_command(arguments):
-    return [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nnodes=1",
-        "--nproc_per_node=8",
-        str(Path(__file__).resolve()),
-        *arguments,
-    ]
-
-
 def run_matrix(args):
     args.output.mkdir(parents=True, exist_ok=True)
-    levels = args.levels or ("norm", "attention", "model")
+    levels = args.levels or ("norm", "attention")
     shapes = [(4, 2048), (1, 8192)]
     if not args.primary:
         shapes += [(1, 128), (1, 2048), (4, 128), (4, 8192)]
@@ -736,10 +511,6 @@ def run_matrix(args):
                 ]
                 if args.validate_only:
                     command.append("--validate-only")
-                elif level == "model":
-                    command = distributed_command(command[2:])
-                if args.probe_only:
-                    command.append("--probe-only")
                 print(f"Running {name}", flush=True)
                 data = run_process(command, path, args.timeout)
                 data.update(model=args.model, group=group, level=level, batch_size=batch, seq_len=seq)
@@ -753,12 +524,6 @@ def main():
     if args.matrix:
         run_matrix(args)
         return
-    if args.level == "model" and not args.validate_only and "RANK" not in os.environ:
-        data = run_process(distributed_command(sys.argv[1:]), args.output, args.timeout)
-        print(json.dumps({"output": str(args.output), "status": data["status"]}))
-        if data["status"] not in {"ok", "probed", "oom"}:
-            raise SystemExit(1)
-        return
     report = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     try:
         run(args, report)
@@ -769,23 +534,10 @@ def main():
         report["status"] = "oom" if isinstance(error, torch.OutOfMemoryError) else "error"
         report["error"] = f"{type(error).__name__}: {error}"
         report["traceback"] = traceback.format_exc()
-    rank = int(os.environ.get("RANK", "0"))
-    failed = report["status"] in {"error", "oom"}
-    path = (
-        args.output.with_name(f"{args.output.stem}.rank{rank}.json") if "RANK" in os.environ and failed else args.output
-    )
-    if rank == 0 or failed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, indent=2, default=str) + "\n")
-        print(json.dumps({"output": str(path), "status": report["status"]}), flush=True)
-    if "RANK" in os.environ:
-        if failed:
-            # Let torchrun stop peers immediately, rather than hang in collectives.
-            raise SystemExit(1)
-        import torch.distributed as dist
-
-        dist.destroy_process_group()
-    elif failed and report["status"] != "oom":
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2, default=str) + "\n")
+    print(json.dumps({"output": str(args.output), "status": report["status"]}), flush=True)
+    if report["status"] == "error":
         raise SystemExit(1)
 
 
