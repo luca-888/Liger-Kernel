@@ -1,6 +1,6 @@
 # Qwen instance Q/K norm benchmark
 
-This report measures the additional Q/K RMSNorm patch on already-created HF models. The completed results cover **96 one-GPU norm/attention cases** across four official configurations. Full-model training performance is outside this PR's scope. The PR remains Draft because one baseline-reproduced convergence failure remains unresolved. No earlier measurements are reused.
+This report measures the additional Q/K RMSNorm patch on already-created HF models. The completed results cover **96 one-GPU norm/attention cases** across four official configurations. Full-model training performance is outside this PR's scope. One known baseline convergence failure is documented below. No earlier measurements are reused.
 
 ## Comparison and model scope
 
@@ -65,7 +65,7 @@ Fresh H100 80GB runs passed **21 instance tests and 64 RMSNorm numerical tests**
 | Qwen3.5 MoE LM / text base / conditional generation / multimodal base | 4 passed | Pass / No existing case | Skip / No existing case | Pass / Pass |
 | Existing Qwen3 VL / VL MoE instance and RoPE checks | 8 passed | Not selected | Not selected | Not selected |
 
-Text convergence totals **12 passed, 1 failed, 5 existing skips**; multimodal convergence totals **4 passed**. The BF16 Qwen3 MoE logits top-k log-probability assertion also fails on original main. Its FLCE case passes on both versions. These convergence tests patch classes before constructing models, so they do not exercise the modified instance branch; they cannot replace the instance regression tests. The numerical failure remains unresolved and the PR stays Draft. No tolerance was changed.
+Text convergence totals **12 passed, 1 failed, 5 existing skips**; multimodal convergence totals **4 passed**. The BF16 Qwen3 MoE logits top-k log-probability assertion fails on both original main and this branch. Its FLCE case passes on both versions. These convergence tests patch classes before constructing models, so they do not execute the instance-patching changes in this PR; they cannot replace the instance regression tests. This is a known baseline test failure whose numerical root cause remains unidentified. No tolerance was changed.
 
 Eight multi-GPU DTensor RMSNorm cases were deselected; the complete repository suites were not run. An initial convergence attempt hit FLA's known Hopper/Triton guard; its logs are retained as a superseded environment diagnostic. The final convergence runs use the supported TileLang backend, whose actual forward/backward probe passed with finite gradients. All final correctness runs used H100 80GB; the initial incompatible-environment attempt used H100 NVL.
 
