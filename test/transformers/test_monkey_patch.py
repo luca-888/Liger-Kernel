@@ -12,6 +12,7 @@ import transformers
 from packaging import version
 from test.utils import get_mllama_rope_config
 from test.utils import get_qwen3_vl_rope_config
+from transformers import AutoModel
 from transformers import AutoModelForCausalLM
 from transformers import PretrainedConfig
 from transformers import PreTrainedModel
@@ -2310,8 +2311,45 @@ def test_apply_liger_kernel_to_instance_for_qwen2():
             pytest.fail(f"An exception occured in extra_expr: {type(e).__name__} - {e}")
 
 
+def _check_qwen_qk_norm_patch(model, text_model, gemma=False, **kwargs):
+    qk_norms = [
+        norm
+        for layer in text_model.layers
+        if hasattr(layer, "self_attn")
+        for norm in (layer.self_attn.q_norm, layer.self_attn.k_norm)
+    ]
+    assert qk_norms, "The test must include full attention Q/K norms"
+    linear_norms = [layer.linear_attn.norm for layer in text_model.layers if hasattr(layer, "linear_attn")]
+    if gemma:
+        assert linear_norms, "The hybrid model test must also include linear attention"
+    linear_forwards = [norm.forward for norm in linear_norms]
+    original = [
+        (norm.weight, norm.weight.detach().clone(), norm.eps if gemma else norm.variance_epsilon) for norm in qk_norms
+    ]
+    native_forwards = [norm.forward for norm in qk_norms]
+    for norm in qk_norms:
+        assert inspect.getsource(norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+
+    _apply_liger_kernel_to_instance(
+        model=model, rms_norm=False, rope=False, swiglu=False, fused_linear_cross_entropy=False
+    )
+    assert [norm.forward for norm in qk_norms] == native_forwards
+
+    _apply_liger_kernel_to_instance(model=model, **kwargs)
+    for norm, (weight, values, epsilon) in zip(qk_norms, original):
+        assert inspect.getsource(norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        assert norm.weight is weight
+        assert torch.equal(norm.weight, values)
+        assert norm.variance_epsilon == epsilon
+        assert norm.offset == (1.0 if gemma else 0.0)
+        assert norm.casting_mode == ("gemma" if gemma else "llama")
+        assert norm.in_place is not gemma
+    assert [norm.forward for norm in linear_norms] == linear_forwards
+
+
 @pytest.mark.skipif(not is_qwen3_available(), reason="qwen3 module not available")
-def test_apply_liger_kernel_to_instance_for_qwen3():
+@pytest.mark.parametrize("base_model", [False, True])
+def test_apply_liger_kernel_to_instance_for_qwen3(base_model):
     # Ensure any monkey patching is cleaned up for subsequent tests
     with patch("transformers.models.qwen3.modeling_qwen3"):
         from liger_kernel.transformers.model.qwen3 import lce_forward as qwen3_lce_forward
@@ -2325,23 +2363,27 @@ def test_apply_liger_kernel_to_instance_for_qwen3():
             hidden_act="silu",
             num_hidden_layers=2,
         )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+        model_class = AutoModel if base_model else AutoModelForCausalLM
+        dummy_model_instance = model_class.from_config(config)
+        text_model = dummy_model_instance if base_model else dummy_model_instance.model
 
         # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             assert inspect.getsource(layer.mlp.forward) != inspect.getsource(LigerSwiGLUMLP.forward)
             assert inspect.getsource(layer.input_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(dummy_model_instance, text_model, fused_linear_cross_entropy=not base_model)
 
         # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             assert inspect.getsource(layer.mlp.forward) == inspect.getsource(LigerSwiGLUMLP.forward)
             assert inspect.getsource(layer.input_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
             assert inspect.getsource(layer.post_attention_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
@@ -2353,7 +2395,8 @@ def test_apply_liger_kernel_to_instance_for_qwen3():
 
 
 @pytest.mark.skipif(not is_qwen3_available(), reason="qwen3 module not available")
-def test_apply_liger_kernel_to_instance_for_qwen3_moe():
+@pytest.mark.parametrize("base_model", [False, True])
+def test_apply_liger_kernel_to_instance_for_qwen3_moe(base_model):
     # Ensure any monkey patching is cleaned up for subsequent tests
     with patch("transformers.models.qwen3_moe.modeling_qwen3_moe"):
         from liger_kernel.transformers.model.qwen3_moe import lce_forward as qwen3_moe_lce_forward
@@ -2367,12 +2410,15 @@ def test_apply_liger_kernel_to_instance_for_qwen3_moe():
             hidden_act="silu",
             num_hidden_layers=2,
         )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+        model_class = AutoModel if base_model else AutoModelForCausalLM
+        dummy_model_instance = model_class.from_config(config)
+        text_model = dummy_model_instance if base_model else dummy_model_instance.model
 
         # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_moe_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_moe_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if IS_TRANSFORMERS_V5_OR_LATER:
                 assert inspect.getsource(layer.mlp.experts.forward) != inspect.getsource(LigerExperts.forward)
             else:
@@ -2382,12 +2428,13 @@ def test_apply_liger_kernel_to_instance_for_qwen3_moe():
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(dummy_model_instance, text_model, fused_linear_cross_entropy=not base_model)
 
         # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_moe_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_moe_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if IS_TRANSFORMERS_V5_OR_LATER:
                 assert inspect.getsource(layer.mlp.experts.forward) == inspect.getsource(LigerExperts.forward)
             else:
@@ -3324,7 +3371,8 @@ def test_apply_liger_kernel_to_instance_for_smollm3():
 
 
 @pytest.mark.skipif(not is_qwen3_next_available(), reason="qwen3_next module not available")
-def test_apply_liger_kernel_to_instance_for_qwen3_next():
+@pytest.mark.parametrize("base_model", [False, True])
+def test_apply_liger_kernel_to_instance_for_qwen3_next(base_model):
     # Ensure any monkey patching is cleaned up for subsequent tests
     with patch("transformers.models.qwen3_next.modeling_qwen3_next"):
         # Instantiate a dummy model
@@ -3337,16 +3385,20 @@ def test_apply_liger_kernel_to_instance_for_qwen3_next():
             shared_expert_intermediate_size=16,
             hidden_act="silu",
             num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"],
             num_experts=2,
             num_experts_per_tok=1,
             mlp_only_layers=[1],
         )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+        model_class = AutoModel if base_model else AutoModelForCausalLM
+        dummy_model_instance = model_class.from_config(config)
+        text_model = dummy_model_instance if base_model else dummy_model_instance.model
 
         # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_next_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_next_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
                 if IS_TRANSFORMERS_V5_OR_LATER:
                     assert inspect.getsource(layer.mlp.experts.forward) != inspect.getsource(LigerExperts.forward)
@@ -3364,12 +3416,15 @@ def test_apply_liger_kernel_to_instance_for_qwen3_next():
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(
+            dummy_model_instance, text_model, gemma=True, fused_linear_cross_entropy=not base_model
+        )
 
         # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_next_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_next_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
                 if IS_TRANSFORMERS_V5_OR_LATER:
                     assert inspect.getsource(layer.mlp.experts.forward) == inspect.getsource(LigerExperts.forward)
@@ -3393,7 +3448,8 @@ def test_apply_liger_kernel_to_instance_for_qwen3_next():
 
 
 @pytest.mark.skipif(not is_qwen3_5_moe_available(), reason="qwen3_5_moe module not available")
-def test_apply_liger_kernel_to_instance_for_qwen3_5_moe():
+@pytest.mark.parametrize("base_model", [False, True])
+def test_apply_liger_kernel_to_instance_for_qwen3_5_moe(base_model):
     # Ensure any monkey patching is cleaned up for subsequent tests
     with patch("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"):
         from liger_kernel.transformers.model.qwen3_5_moe import lce_forward as qwen3_5_moe_lce_forward
@@ -3407,6 +3463,7 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe():
             shared_expert_intermediate_size=16,
             hidden_act="silu",
             num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"],
             num_attention_heads=2,
             num_key_value_heads=1,
             head_dim=16,
@@ -3418,12 +3475,15 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe():
             num_experts=2,
             num_experts_per_tok=1,
         )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+        model_class = AutoModel if base_model else AutoModelForCausalLM
+        dummy_model_instance = model_class.from_config(config)
+        text_model = dummy_model_instance if base_model else dummy_model_instance.model
 
         # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_5_moe_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_5_moe_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if IS_TRANSFORMERS_V5_OR_LATER:
                 assert inspect.getsource(layer.mlp.experts.forward) != inspect.getsource(LigerExperts.forward)
             else:
@@ -3436,12 +3496,15 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe():
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(
+            dummy_model_instance, text_model, gemma=True, fused_linear_cross_entropy=not base_model
+        )
 
         # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_5_moe_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_5_moe_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             if IS_TRANSFORMERS_V5_OR_LATER:
                 assert inspect.getsource(layer.mlp.experts.forward) == inspect.getsource(LigerExperts.forward)
             else:
@@ -3468,6 +3531,7 @@ def _build_qwen3_5_moe_multimodal_config():
         shared_expert_intermediate_size=16,
         hidden_act="silu",
         num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=16,
@@ -3540,7 +3604,7 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe_for_conditional_generati
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(dummy_model_instance, dummy_model_instance.model.language_model, gemma=True)
 
         # Check that the model's instance variables were correctly patched with Liger modules
         assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(
@@ -3595,7 +3659,7 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe_model():
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(dummy_model_instance, dummy_model_instance.language_model, gemma=True)
 
         # Check that the model's instance variables were correctly patched with Liger modules
         assert inspect.getsource(dummy_model_instance.language_model.norm.forward) == inspect.getsource(
@@ -3620,7 +3684,8 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_moe_model():
 
 
 @pytest.mark.skipif(not is_qwen3_5_available(), reason="qwen3_5 module not available")
-def test_apply_liger_kernel_to_instance_for_qwen3_5():
+@pytest.mark.parametrize("base_model", [False, True])
+def test_apply_liger_kernel_to_instance_for_qwen3_5(base_model):
     # Ensure any monkey patching is cleaned up for subsequent tests
     with patch("transformers.models.qwen3_5.modeling_qwen3_5"):
         # Instantiate a dummy model
@@ -3641,23 +3706,29 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5():
             linear_num_value_heads=2,
             layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
         )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+        model_class = AutoModel if base_model else AutoModelForCausalLM
+        dummy_model_instance = model_class.from_config(config)
+        text_model = dummy_model_instance if base_model else dummy_model_instance.model
 
         # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_5_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen3_5_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             assert inspect.getsource(layer.mlp.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
             assert inspect.getsource(layer.input_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(
+            dummy_model_instance, text_model, gemma=True, fused_linear_cross_entropy=not base_model
+        )
 
         # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_5_lce_forward)
-        assert inspect.getsource(dummy_model_instance.model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for layer in dummy_model_instance.model.layers:
+        if not base_model:
+            assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_5_lce_forward)
+        assert inspect.getsource(text_model.norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        for layer in text_model.layers:
             assert inspect.getsource(layer.mlp.forward) == inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
             assert inspect.getsource(layer.input_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
             assert inspect.getsource(layer.post_attention_layernorm.forward) == inspect.getsource(LigerRMSNorm.forward)
@@ -3729,7 +3800,7 @@ def test_apply_liger_kernel_to_instance_for_qwen3_5_for_conditional_generation()
             assert inspect.getsource(layer.post_attention_layernorm.forward) != inspect.getsource(LigerRMSNorm.forward)
 
         # Test applying kernels to the model instance
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+        _check_qwen_qk_norm_patch(dummy_model_instance, dummy_model_instance.model.language_model, gemma=True)
 
         # Check that the model's instance variables were correctly patched with Liger modules
         assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen3_5_lce_forward_for_multimodal)

@@ -1,0 +1,82 @@
+{
+  "base_commit": "95b01e94027cc70ffec7233e89d3e9fa31fb72f7",
+  "hardware": {
+    "requested": "H100!",
+    "allocated": false,
+    "reason": "Modal: Please add a payment method to use H100! GPU functions."
+  },
+  "validated_environment": {
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "test/transformers/test_monkey_patch.py",
+      "-q",
+      "-k",
+      "qwen3",
+      "--junitxml=/tmp/qwen-results/junit.xml"
+    ],
+    "python": "3.12.10",
+    "packages": {
+      "torch": "2.9.1",
+      "triton": "3.5.1",
+      "transformers": "5.15.1"
+    },
+    "cuda": "12.8",
+    "gpu": null,
+    "gpu_memory_bytes": null,
+    "driver": null,
+    "exit_code": 0
+  },
+  "instance_tests": {
+    "passed": 21,
+    "failed": 0,
+    "skipped": 0,
+    "cases": [
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl_for_conditional_generation",
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl",
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl_text",
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl_moe_for_conditional_generation",
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl_moe",
+      "test_apply_liger_kernel_to_instance_for_qwen3_vl_moe_text",
+      "test_qwen3_vl_rope_hooks_applied",
+      "test_qwen3_vl_moe_rope_hooks_applied",
+      "test_apply_liger_kernel_to_instance_for_qwen3[False]",
+      "test_apply_liger_kernel_to_instance_for_qwen3[True]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_moe[False]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_moe[True]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_next[False]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_next[True]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5_moe[False]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5_moe[True]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5_moe_for_conditional_generation",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5_moe_model",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5[False]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5[True]",
+      "test_apply_liger_kernel_to_instance_for_qwen3_5_for_conditional_generation"
+    ]
+  },
+  "benchmark_meta_validation": {
+    "passed": 4,
+    "scope": "Native full-config construction, B/C forward binding and noncontiguous query layout only; no CUDA execution"
+  },
+  "checkstyle": "passed",
+  "not_executed": [
+    "H100 RMSNorm numerical tests",
+    "H100 instance tests",
+    "Existing affected text and multimodal convergence tests",
+    "Q/K norm B/C forward, backward, forward+backward timings",
+    "Complete attention B/C timings",
+    "Full text-model training step B/C timings, tokens/s and peak GPU allocated memory"
+  ],
+  "performance": {
+    "norm": null,
+    "attention": null,
+    "training_step": null
+  },
+  "artifacts": "validation-logs.tar.gz",
+  "baseline_regression": {
+    "expected_failures": 13,
+    "failure": "New Q/K norm forward binding assertion, test_monkey_patch.py:2340"
+  }
+}
