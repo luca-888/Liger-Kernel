@@ -21,9 +21,12 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("qwen3", "qwen3_5"), required=True)
+    parser.add_argument(
+        "--model", choices=("qwen3", "qwen3_moe", "qwen3_next", "qwen3_5", "qwen3_5_moe"), required=True
+    )
     parser.add_argument("--group", choices=("B", "C"))
     parser.add_argument("--level", choices=("norm", "attention", "model"))
+    parser.add_argument("--levels", nargs="+", choices=("norm", "attention", "model"), help="Limit matrix levels.")
     parser.add_argument("--batch-size", type=int, choices=(1, 4))
     parser.add_argument("--seq-len", type=int, choices=(128, 2048, 8192))
     parser.add_argument("--overwrite", action="store_true", help="Accepted for make run-benchmarks compatibility.")
@@ -145,27 +148,29 @@ def run(args, report):
     import torch
     import transformers
 
-    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen3
-    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen3_5
+    from liger_kernel.transformers import monkey_patch
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
 
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-    device = "meta" if args.validate_only else "cuda"
+    large_model = args.model in {"qwen3_moe", "qwen3_next", "qwen3_5_moe"}
+    gemma = args.model in {"qwen3_next", "qwen3_5", "qwen3_5_moe"}
+    device = "meta" if args.validate_only or large_model else "cuda"
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     config_path = Path(__file__).resolve().parents[1] / "data/qwen_qk_norm/configs" / f"{args.model}.json"
     source = json.loads(config_path.read_text())
     raw_config = source["config"].get("text_config", source["config"])
-    if args.model == "qwen3":
-        config_cls = transformers.Qwen3Config
-        model_cls = transformers.Qwen3ForCausalLM
-        patch = apply_liger_kernel_to_qwen3
-    else:
-        config_cls = transformers.Qwen3_5TextConfig
-        model_cls = transformers.Qwen3_5ForCausalLM
-        patch = apply_liger_kernel_to_qwen3_5
+    classes = {
+        "qwen3": ("Qwen3Config", "Qwen3ForCausalLM"),
+        "qwen3_moe": ("Qwen3MoeConfig", "Qwen3MoeForCausalLM"),
+        "qwen3_next": ("Qwen3NextConfig", "Qwen3NextForCausalLM"),
+        "qwen3_5": ("Qwen3_5TextConfig", "Qwen3_5ForCausalLM"),
+        "qwen3_5_moe": ("Qwen3_5MoeTextConfig", "Qwen3_5MoeForCausalLM"),
+    }
+    config_cls, model_cls = (getattr(transformers, name) for name in classes[args.model])
+    patch = getattr(monkey_patch, f"apply_liger_kernel_to_{args.model}")
     config = config_cls.from_dict(raw_config)
     config._attn_implementation = "sdpa"
     config.use_cache = False
@@ -199,8 +204,8 @@ def run(args, report):
             "optimizer": "AdamW(lr=1e-5, fused=True)" if args.level == "model" else None,
         },
     )
-    # The full, unmodified text configuration is constructed even for isolated
-    # norm/attention measurements. There is no model-depth reduction.
+    # Construct the original full-depth configuration before patching. Large
+    # MoE variants remain on meta except for the measured attention module.
     with torch.device(device):
         previous_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
@@ -246,9 +251,9 @@ def run(args, report):
         "note": "B restores native forward; Liger-only attributes are unused in B.",
     }
     if args.validate_only:
-        query_width = config.head_dim * (2 if args.model == "qwen3_5" else 1)
+        query_width = config.head_dim * (2 if gemma else 1)
         query = torch.empty(args.batch_size, args.seq_len, config.num_attention_heads, query_width, device="meta")
-        if args.model == "qwen3_5":
+        if gemma:
             query = query.chunk(2, dim=-1)[0]
             assert not query.is_contiguous()
         report["validated_query_layout"] = {"shape": list(query.shape), "stride": list(query.stride())}
@@ -256,10 +261,39 @@ def run(args, report):
             "Meta-device configuration, model construction, forward bindings and query layout only; no CUDA execution."
         )
         return
+    if large_model and args.level == "model":
+        # BF16 parameters + their gradients alone exceed this single GPU before
+        # AdamW state or activations. This is a capacity bound, not a measured OOM.
+        lower_bound = report["parameter_count"] * 4
+        assert lower_bound > report["environment"]["gpu_memory_bytes"]
+        report.update(
+            status="capacity_excluded",
+            parameter_and_gradient_lower_bound_bytes=lower_bound,
+            scope="Full MoE training cannot fit on one H100; no reduced model or routing measurement substituted.",
+        )
+        return
+    base = model.model
+    attention = next(layer.self_attn for layer in base.layers if hasattr(layer, "self_attn"))
+    rotary_embedding = base.rotary_emb
+    if large_model:
+        attention.to_empty(device="cuda")
+        with torch.no_grad():
+            for name, parameter in attention.named_parameters():
+                if parameter.ndim > 1:
+                    torch.nn.init.normal_(parameter, std=config.initializer_range)
+                elif name in {"q_norm.weight", "k_norm.weight"}:
+                    parameter.fill_(0.0 if gemma else 1.0)
+                else:
+                    parameter.zero_()
+        rotary_embedding = type(rotary_embedding)(config, device="cuda")
+        report["scope"] = "Full-size attention from original model config; remaining model stays meta. No MoE routing."
+    measured_model = attention if large_model else model
+    report["materialized_parameter_count"] = sum(parameter.numel() for parameter in measured_model.parameters())
+    report["weight_hash_scope"] = "attention" if large_model else "full_text_model"
     # Exact initial-parameter identity, computed before warmup/timing. No model
     # weights are downloaded; these bytes came from seeded random initialization.
     digest = hashlib.sha256()
-    for name, parameter in model.named_parameters():
+    for name, parameter in measured_model.named_parameters():
         digest.update(name.encode())
         digest.update(parameter.detach().view(torch.uint8).cpu().numpy().tobytes())
     report["initial_weights_sha256"] = digest.hexdigest()
@@ -283,15 +317,13 @@ def run(args, report):
         report["scope"] = "Full text causal LM; Qwen3.5 vision encoder is not instantiated."
         return
 
-    base = model.model
-    attention = next(layer.self_attn for layer in base.layers if hasattr(layer, "self_attn"))
     hidden = torch.randn(
         args.batch_size, args.seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     report["input_checksum"] = hidden.detach().double().sum().item()
     if args.level == "attention":
         positions = torch.arange(args.seq_len, device="cuda").unsqueeze(0).expand(args.batch_size, -1)
-        rotary = base.rotary_emb(hidden, positions)
+        rotary = rotary_embedding(hidden, positions)
         report["measurements"] = {
             "attention": measure_operation(
                 lambda: (attention(hidden, position_embeddings=rotary, attention_mask=None)[0],),
@@ -306,7 +338,7 @@ def run(args, report):
     # Materialize projections once, preserving exactly HF's pre-norm view/chunk
     # strides. Norm timing includes any contiguous copies performed by Liger.
     with torch.no_grad():
-        if args.model == "qwen3_5":
+        if gemma:
             query, _ = (
                 attention.q_proj(hidden).view(args.batch_size, args.seq_len, -1, 2 * config.head_dim).chunk(2, -1)
             )
@@ -319,7 +351,7 @@ def run(args, report):
         name: {"shape": list(tensor.shape), "stride": list(tensor.stride()), "contiguous": tensor.is_contiguous()}
         for name, tensor in (("q", query), ("k", key))
     }
-    if args.model == "qwen3_5":
+    if gemma:
         assert not query.is_contiguous(), "Query/gate layout must retain its native gaps."
     report["measurements"] = {}
     for name, forward, inputs, norms in (
@@ -387,14 +419,17 @@ def write_comparison(directory, model):
                 )
     if rows:
         with (directory / f"{model}_comparison.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+            writer = csv.DictWriter(stream, fieldnames=rows[0].keys(), lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
 
 
 def run_matrix(args):
     args.output.mkdir(parents=True, exist_ok=True)
-    for level in ("norm", "attention", "model"):
+    levels = args.levels or (
+        ("norm", "attention", "model") if args.model in {"qwen3", "qwen3_5"} else ("norm", "attention")
+    )
+    for level in levels:
         for shape_index, (batch, seq) in enumerate((b, s) for b in (1, 4) for s in (128, 2048, 8192)):
             for group in ("B", "C") if shape_index % 2 == 0 else ("C", "B"):
                 name = f"{args.model}_{level}_b{batch}_s{seq}_{group}"
@@ -444,7 +479,7 @@ def main():
     report = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     try:
         run(args, report)
-        report["status"] = "validated" if args.validate_only else "ok"
+        report.setdefault("status", "validated" if args.validate_only else "ok")
     except Exception as error:
         import torch
 
