@@ -318,7 +318,7 @@ def _fwd_cached(
 
 
 # ===========================================================================
-# Backward kernel — persistent, one block per SM, rows_per_program rows each.
+# Backward kernel — persistent, at most one block per SM, rows_per_program rows each.
 #
 # Each block walks ``rows_per_program`` consecutive rows. For each row it:
 #   (1) loads X[row,:], dY[row,:], Mean[row], RSTD[row];
@@ -518,14 +518,16 @@ def _layer_norm_backward(dY, X, W, B, Mean, RSTD, TILE_SIZE):
         )
 
     sms = _num_sms(device)
-    rows_per_program = math.ceil(n_rows / sms)
+    # Keep contiguous row groups and omit CTAs with no rows to process.
+    rows_per_program = max(1, math.ceil(n_rows / sms))
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program))
 
     dX_flat = torch.empty_like(dY_flat)
-    # fp32 partials for numerical stability — one row per SM, host-reduced.
-    _dW = torch.empty((sms, n_cols), dtype=torch.float32, device=W.device)
-    _dB = torch.empty((sms, n_cols), dtype=torch.float32, device=W.device)
+    # fp32 partials for numerical stability — one row per CTA, host-reduced.
+    _dW = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
+    _dB = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
 
-    grid = (sms,)
+    grid = (num_ctas,)
     _launch(
         device,
         grid,
@@ -547,7 +549,7 @@ def _layer_norm_backward(dY, X, W, B, Mean, RSTD, TILE_SIZE):
 class _LigerLayerNormCuTileFunction(torch.autograd.Function):
     """cuTile LayerNorm. ``mode`` selects between standard / persistent /
     cached forward variants. Backward always uses the single persistent
-    kernel (rows split across SMs)."""
+    kernel (rows split into contiguous groups)."""
 
     @staticmethod
     def forward(ctx, X, W, B, eps, mode):

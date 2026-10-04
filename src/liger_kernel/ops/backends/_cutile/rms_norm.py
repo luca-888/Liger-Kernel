@@ -520,7 +520,7 @@ def _fwd_no_w_none(
 
 
 # ===========================================================================
-# Backward kernels — persistent, one block per SM, rows_per_program rows each
+# Backward kernels — persistent, at most one block per SM, rows_per_program rows each
 #
 # Math (matches the Triton kernel):
 #   m  = dY * (offset + W)
@@ -1092,12 +1092,14 @@ def _rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, TILE_SIZE, in_place
     else:
         dX_flat = torch.empty_like(dY_flat)
 
-    rows_per_program = math.ceil(n_rows / sms)
-    grid = (sms,)
+    # Keep contiguous row groups and omit CTAs with no rows to process.
+    rows_per_program = max(1, math.ceil(n_rows / sms))
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program))
+    grid = (num_ctas,)
 
     if elementwise_affine:
-        # Partial dW: one fp32 row per SM, reduced on the host after launch.
-        _dW = torch.empty((sms, n_cols), dtype=torch.float32, device=W.device)
+        # Partial dW: one fp32 row per CTA, reduced on the host after launch.
+        _dW = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
         kernel = _BWD[casting_mode]
         _launch(
             device,

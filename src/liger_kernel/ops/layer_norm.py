@@ -253,16 +253,19 @@ def layer_norm_backward(dY, X, W, B, Mean, RSTD):
     elif X.device.type == "npu":
         sm_count = get_npu_core_count()
 
+    # Keep contiguous row groups and omit CTAs with no rows to process.
+    rows_per_program = max(1, math.ceil(n_rows / sm_count))
+    num_ctas = max(1, math.ceil(n_rows / rows_per_program))
+
     # fp32 for numerical stability especially.
-    _DW = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
-    _DB = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
+    _DW = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
+    _DB = torch.empty((num_ctas, n_cols), dtype=torch.float32, device=W.device)
 
     # Calculate optimal block size and warp configuration
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
     if n_cols > BLOCK_SIZE:
         raise RuntimeError(f"Feature dimension {n_cols} exceeds maximum supported size of {BLOCK_SIZE}.")
-    rows_per_program = math.ceil(n_rows / sm_count)
-    grid = (sm_count,)
+    grid = (num_ctas,)
 
     # Allocate gradient tensors
     DX = torch.empty((n_rows, n_cols), dtype=X.dtype, device=X.device)
@@ -273,7 +276,7 @@ def layer_norm_backward(dY, X, W, B, Mean, RSTD):
         kernel_args.update({"num_warps": 32, "num_stages": 4})
         set_large_grf_mode(kernel_args)
 
-    # Launch kernel with one thread block per row for optimal performance
+    # Launch one thread block per nonempty row group.
     _layer_norm_backward_kernel[grid](
         X,
         X.stride(0),
